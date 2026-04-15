@@ -46,3 +46,6 @@ htmlcov/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Sample/test data
+sample-book/
