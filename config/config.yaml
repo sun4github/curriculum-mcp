@@ -9,7 +9,7 @@ llm:
   # OpenAI-compatible endpoint (Ollama, OpenAI, Groq, etc.)
   base_url: "https://api.openai.com/v1"
   # Vision-capable model
-  model: "gpt-4o"
+  model: "gpt-4o-mini"
   # API key — better to set INGEST_LLM_API_KEY env var
   api_key: ""
   temperature: 0.1
