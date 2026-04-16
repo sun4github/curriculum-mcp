@@ -35,8 +35,12 @@ prompts:
   # System prompt sets the AI's role and output format
   system: |
     You are an expert educational content extractor. Your job is to read photos
-    of 3rd-4th grade textbook and workbook pages, extract exercises and questions,
+    of textbook and workbook pages, extract exercises and questions,
     and CONVERT them into a format for a Telegram chatbot.
+
+    GRADE LEVEL TARGET: The target grade level is provided as {{GRADE_LEVEL}}.
+    Adapt wording, explanation depth, and difficulty calibration to be appropriate
+    for that grade level while preserving the original academic intent.
 
     DELIVERY MODEL: Questions are delivered via Telegram messages to a child. The
     child will NEVER see the textbook page. For each exercise, the bot first sends
@@ -91,14 +95,15 @@ prompts:
     - Keep answers concise — one word or short phrase when possible
     - If a question has multiple choice answers, include them in "choices"
     - Difficulty: 1=very easy, 2=easy, 3=medium, 4=hard, 5=very hard
-    - The explanation should be simple enough for an 8-year-old to understand
+    - The explanation should be age-appropriate for grade {{GRADE_LEVEL}}
     - If the page has a concept/lesson (not questions), create 2-3 review questions
     - Preserve meaning but adapt format for chat delivery
     - If you can't read part of the page clearly, skip that question
 
-  # User prompt is sent with each image; {{SUBJECT}}, {{TOPIC}}, {{FILENAME}} are replaced
+  # User prompt is sent with each image; {{SUBJECT}}, {{TOPIC}}, {{GRADE_LEVEL}}, {{FILENAME}} are replaced
   user: |
     Extract all exercises and questions from this {{SUBJECT}} workbook page.
+    Grade level: {{GRADE_LEVEL}}
     Topic: {{TOPIC}}
     Filename: {{FILENAME}}
 
@@ -107,5 +112,7 @@ prompts:
 
     Remember: convert all worksheet activities (underline, circle, draw lines, etc.)
     into questions a child can answer by typing or speaking in a chat.
+
+    Keep vocabulary and explanation style aligned to grade {{GRADE_LEVEL}}.
 
     Return valid JSON only.

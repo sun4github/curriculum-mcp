@@ -22,9 +22,9 @@ Folder layout:
   The AI will detect the topic from the page images, same as loose images.
 
 Usage:
-  python3 ingest.py --folder ./math-workbook --subject math [--dry-run]
-  python3 ingest.py --folder ./math-workbook --subject math --immediate   # skip batch, call LLM one-by-one
-  python3 ingest.py --folder ./math-workbook --subject math --resume-batch <batch_id>  # resume a batch
+    python3 ingest.py --folder ./math-workbook --subject math --gradeLevel 4 [--dry-run]
+    python3 ingest.py --folder ./math-workbook --subject math --gradeLevel 4 --immediate   # skip batch, call LLM one-by-one
+    python3 ingest.py --folder ./math-workbook --subject math --gradeLevel 4 --resume-batch <batch_id>  # resume a batch
 
 Config:
   Copy config.example.yaml to config.yaml and customize prompts + DB settings.
@@ -92,7 +92,7 @@ def get_image_mime(image_path: str) -> str:
     return mime_map.get(ext, "image/jpeg")
 
 
-def build_request_body(config: dict, image_path: str, subject: str, topic: str | None) -> dict:
+def build_request_body(config: dict, image_path: str, subject: str, topic: str | None, grade_level: int) -> dict:
     """Build the chat/completions request body (shared by immediate and batch modes)."""
     llm_cfg = config["llm"]
     b64 = encode_image(image_path)
@@ -102,6 +102,7 @@ def build_request_body(config: dict, image_path: str, subject: str, topic: str |
     user_prompt = config["prompts"]["user"]
     user_prompt = user_prompt.replace("{{SUBJECT}}", subject)
     user_prompt = user_prompt.replace("{{TOPIC}}", topic or "auto-detect")
+    user_prompt = user_prompt.replace("{{GRADE_LEVEL}}", str(grade_level))
     user_prompt = user_prompt.replace("{{FILENAME}}", Path(image_path).name)
 
     return {
@@ -125,13 +126,13 @@ def build_request_body(config: dict, image_path: str, subject: str, topic: str |
     }
 
 
-def call_llm(config: dict, image_path: str, subject: str, topic: str | None) -> dict:
+def call_llm(config: dict, image_path: str, subject: str, topic: str | None, grade_level: int) -> dict:
     """Send image to multimodal LLM immediately and return structured Q&A dict."""
     llm_cfg = config["llm"]
     api_key = os.getenv("INGEST_LLM_API_KEY") or llm_cfg.get("api_key", "")
     base_url = llm_cfg["base_url"].rstrip("/")
 
-    payload = build_request_body(config, image_path, subject, topic)
+    payload = build_request_body(config, image_path, subject, topic, grade_level)
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
@@ -159,11 +160,11 @@ def get_batch_base_url(config: dict) -> str:
 # Batch API
 # ---------------------------------------------------------------------------
 
-def build_batch_jsonl(config: dict, registry: dict, subject: str) -> str:
+def build_batch_jsonl(config: dict, registry: dict, subject: str, grade_level: int) -> str:
     """Return JSONL string — one request per line — for the OpenAI Batch API."""
     lines = []
     for custom_id, meta in registry.items():
-        body = build_request_body(config, str(meta["image_path"]), subject, meta["topic"])
+        body = build_request_body(config, str(meta["image_path"]), subject, meta["topic"], grade_level)
         lines.append(json.dumps({
             "custom_id": custom_id,
             "method": "POST",
@@ -294,7 +295,8 @@ def ensure_schema(conn):
                 id SERIAL PRIMARY KEY,
                 subject_id INTEGER REFERENCES subjects(id) ON DELETE CASCADE,
                 name TEXT NOT NULL,
-                UNIQUE(subject_id, name)
+                grade_level INTEGER NOT NULL CHECK (grade_level BETWEEN 1 AND 12),
+                UNIQUE(subject_id, name, grade_level)
             );
         """)
         cur.execute("""
@@ -344,6 +346,9 @@ def ensure_schema(conn):
             CREATE INDEX IF NOT EXISTS idx_exercises_topic ON exercises(topic_id);
         """)
         cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_topics_subject_grade ON topics(subject_id, grade_level);
+        """)
+        cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_questions_exercise ON questions(exercise_id);
         """)
         cur.execute("""
@@ -361,11 +366,11 @@ def upsert_subject(conn, name: str) -> int:
         return cur.fetchone()[0]
 
 
-def upsert_topic(conn, subject_id: int, name: str) -> int:
+def upsert_topic(conn, subject_id: int, name: str, grade_level: int) -> int:
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO topics (subject_id, name) VALUES (%s, %s) ON CONFLICT (subject_id, name) DO UPDATE SET name = EXCLUDED.name RETURNING id",
-            (subject_id, name),
+            "INSERT INTO topics (subject_id, name, grade_level) VALUES (%s, %s, %s) ON CONFLICT (subject_id, name, grade_level) DO UPDATE SET name = EXCLUDED.name RETURNING id",
+            (subject_id, name, grade_level),
         )
         return cur.fetchone()[0]
 
@@ -533,6 +538,7 @@ def _process_all_results(
     registry: dict,
     conn,
     subject_id: int | None,
+    grade_level: int,
     dry_run: bool,
 ) -> tuple[int, int]:
     """Group results by group_key, merge subfolders, and insert into DB (or print for dry-run)."""
@@ -572,7 +578,7 @@ def _process_all_results(
                     print(f"    A{j}: {q.get('answer', '')[:80]}")
                 continue
 
-            topic_id = upsert_topic(conn, subject_id, merged["topic"])
+            topic_id = upsert_topic(conn, subject_id, merged["topic"], grade_level)
             source_pages = "+".join(meta["image_path"].stem for _, meta in pages)
             try:
                 exercise_id = insert_exercise(
@@ -628,7 +634,7 @@ def _process_all_results(
                             print(f"    A{j}: {q.get('answer', '')[:80]}")
                     continue
 
-                page_topic_id = upsert_topic(conn, subject_id, page_topic)
+                page_topic_id = upsert_topic(conn, subject_id, page_topic, grade_level)
                 source_page = img_path.stem
                 try:
                     for ei, ex in enumerate(exercises):
@@ -653,7 +659,7 @@ def _process_all_results(
     return total_inserted, total_errors
 
 
-def ingest_folder(config: dict, folder: Path, subject: str, dry_run: bool, immediate: bool = False, resume_batch_id: str | None = None):
+def ingest_folder(config: dict, folder: Path, subject: str, grade_level: int, dry_run: bool, immediate: bool = False, resume_batch_id: str | None = None):
     topics = discover_topics(folder)
     if not topics:
         print(f"No images found in {folder}")
@@ -667,6 +673,7 @@ def ingest_folder(config: dict, folder: Path, subject: str, dry_run: bool, immed
 
     print(f"Found {total_images} images in {folder}")
     print(f"Subject: {subject}")
+    print(f"Grade level: {grade_level}")
     if subfolder_count:
         print(f"Subfolder images (AI auto-detect topic, merge pages): {subfolder_count}")
     if loose_count:
@@ -687,7 +694,7 @@ def ingest_folder(config: dict, folder: Path, subject: str, dry_run: bool, immed
         for i, (custom_id, meta) in enumerate(registry.items(), 1):
             print(f"[{i}/{total_images}] Processing: {meta['image_path'].name}")
             try:
-                result = call_llm(config, str(meta["image_path"]), subject, meta["topic"])
+                result = call_llm(config, str(meta["image_path"]), subject, meta["topic"], grade_level)
                 llm_results[custom_id] = result
             except Exception as e:
                 print(f"  ERROR: LLM call failed: {e}")
@@ -703,7 +710,7 @@ def ingest_folder(config: dict, folder: Path, subject: str, dry_run: bool, immed
             batch_id = resume_batch_id
         else:
             print("Building batch JSONL …")
-            jsonl = build_batch_jsonl(config, registry, subject)
+            jsonl = build_batch_jsonl(config, registry, subject, grade_level)
             file_id = upload_batch_file(batch_base_url, api_key, jsonl)
             batch_id = create_batch(batch_base_url, api_key, file_id)
 
@@ -724,7 +731,7 @@ def ingest_folder(config: dict, folder: Path, subject: str, dry_run: bool, immed
         subject_id = upsert_subject(conn, subject)
 
     total_inserted, total_errors = _process_all_results(
-        llm_results, registry, conn, subject_id, dry_run
+        llm_results, registry, conn, subject_id, grade_level, dry_run
     )
 
     if conn:
@@ -742,6 +749,7 @@ def main():
     parser = argparse.ArgumentParser(description="Ingest textbook photos into curriculum database")
     parser.add_argument("--folder", "-f", type=str, default=None, help="Folder containing page photos organized in subfolders by topic")
     parser.add_argument("--subject", "-s", type=str, default="general", help="Subject name (e.g., math, science, ela)")
+    parser.add_argument("--gradeLevel", dest="grade_level", type=int, required=True, choices=range(1, 13), help="Grade level (1-12)")
     parser.add_argument("--dry-run", "-n", action="store_true", help="Extract questions but don't insert into DB")
     parser.add_argument("--immediate", action="store_true", help="Call LLM one image at a time (skips Batch API; slower, no discount)")
     parser.add_argument("--resume-batch", metavar="BATCH_ID", default=None, help="Resume polling an existing batch job by its ID")
@@ -755,7 +763,7 @@ def main():
         sys.exit(1)
 
     ingest_folder(
-        config, folder, args.subject, args.dry_run,
+        config, folder, args.subject, args.grade_level, args.dry_run,
         immediate=args.immediate,
         resume_batch_id=args.resume_batch,
     )
