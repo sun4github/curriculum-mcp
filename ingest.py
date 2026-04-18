@@ -43,6 +43,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -159,29 +160,45 @@ def get_batch_base_url(config: dict) -> str:
 # Batch API
 # ---------------------------------------------------------------------------
 
-def build_batch_jsonl(config: dict, registry: dict, subject: str) -> str:
-    """Return JSONL string — one request per line — for the OpenAI Batch API."""
-    lines = []
+def build_batch_jsonl(config: dict, registry: dict, subject: str) -> tempfile.SpooledTemporaryFile:
+    """Write JSONL — one request per line — to a SpooledTemporaryFile and return it seeked to 0.
+
+    Encodes and writes each request individually so only one base64 image
+    is held in memory at a time, with no second copy from string joining.
+    The spool spills to disk after 16 MB, keeping RAM bounded regardless
+    of batch size.
+    """
+    buf: tempfile.SpooledTemporaryFile = tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024)
+    first = True
     for custom_id, meta in registry.items():
         body = build_request_body(config, str(meta["image_path"]), subject, meta["topic"])
-        lines.append(json.dumps({
+        line = json.dumps({
             "custom_id": custom_id,
             "method": "POST",
             "url": "/v1/chat/completions",
             "body": body,
-        }))
-    return "\n".join(lines)
+        })
+        if not first:
+            buf.write(b"\n")
+        buf.write(line.encode())
+        first = False
+    buf.seek(0)
+    return buf
 
 
-def upload_batch_file(batch_base_url: str, api_key: str, jsonl_content: str) -> str:
-    """Upload JSONL to OpenAI Files API with purpose=batch. Returns file_id."""
+def upload_batch_file(batch_base_url: str, api_key: str, jsonl_file) -> str:
+    """Upload JSONL file handle to OpenAI Files API with purpose=batch. Returns file_id.
+
+    Accepts any file-like object (e.g. SpooledTemporaryFile) and streams it
+    directly to the API without loading the entire content into memory.
+    """
     url = f"{batch_base_url}/files"
     headers = {"Authorization": f"Bearer {api_key}"}
     resp = requests.post(
         url,
         headers=headers,
         files={
-            "file": ("batch_requests.jsonl", io.BytesIO(jsonl_content.encode()), "application/jsonl"),
+            "file": ("batch_requests.jsonl", jsonl_file, "application/jsonl"),
             "purpose": (None, "batch"),
         },
         timeout=120,
@@ -220,8 +237,10 @@ def poll_batch(batch_base_url: str, api_key: str, batch_id: str, poll_interval: 
     url = f"{batch_base_url}/batches/{batch_id}"
     headers = {"Authorization": f"Bearer {api_key}"}
 
-    print(f"Polling batch {batch_id} every {poll_interval}s …")
-    while True:
+    print(f"Polling batch {batch_id} (initial interval {poll_interval}s, max 25 h) …")
+    deadline = time.time() + 25 * 3600
+    interval = float(poll_interval)
+    while time.time() < deadline:
         resp = requests.get(url, headers=headers, timeout=30)
         resp.raise_for_status()
         data = resp.json()
@@ -237,30 +256,36 @@ def poll_batch(batch_base_url: str, api_key: str, batch_id: str, poll_interval: 
         if status in ("failed", "expired", "cancelled"):
             raise RuntimeError(f"Batch {batch_id} ended with status: {status}")
 
-        time.sleep(poll_interval)
+        remaining = deadline - time.time()
+        time.sleep(min(interval, remaining))
+        interval = min(interval * 1.5, 300)
+    raise TimeoutError(f"Batch {batch_id} did not complete within 25 hours")
 
 
 def download_batch_results(batch_base_url: str, api_key: str, output_file_id: str) -> dict:
-    """Download batch output JSONL. Returns dict[custom_id -> parsed result | error dict]."""
+    """Stream batch output JSONL line-by-line. Returns dict[custom_id -> parsed result | error dict].
+
+    Uses response streaming so the full file body is never held in memory at once.
+    """
     url = f"{batch_base_url}/files/{output_file_id}/content"
     headers = {"Authorization": f"Bearer {api_key}"}
-    resp = requests.get(url, headers=headers, timeout=120)
-    resp.raise_for_status()
 
     results = {}
-    for line in resp.text.strip().splitlines():
-        if not line:
-            continue
-        obj = json.loads(line)
-        custom_id = obj["custom_id"]
-        if obj.get("error"):
-            results[custom_id] = {"_error": obj["error"]}
-        else:
-            try:
-                content = obj["response"]["body"]["choices"][0]["message"]["content"]
-                results[custom_id] = json.loads(content)
-            except (KeyError, json.JSONDecodeError) as exc:
-                results[custom_id] = {"_error": str(exc)}
+    with requests.get(url, headers=headers, timeout=120, stream=True) as resp:
+        resp.raise_for_status()
+        for raw in resp.iter_lines():
+            if not raw:
+                continue
+            obj = json.loads(raw)
+            custom_id = obj["custom_id"]
+            if obj.get("error"):
+                results[custom_id] = {"_error": obj["error"]}
+            else:
+                try:
+                    content = obj["response"]["body"]["choices"][0]["message"]["content"]
+                    results[custom_id] = json.loads(content)
+                except (KeyError, json.JSONDecodeError) as exc:
+                    results[custom_id] = {"_error": str(exc)}
     print(f"  Downloaded {len(results)} results from output file {output_file_id}")
     return results
 
@@ -370,42 +395,67 @@ def upsert_topic(conn, subject_id: int, name: str) -> int:
         return cur.fetchone()[0]
 
 
-def insert_exercise(conn, topic_id: int, title: str, context: str | None, instructions: str, source_page: str, sort_order: int) -> int:
-    """Insert an exercise and return its id."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """INSERT INTO exercises (topic_id, title, context, instructions, source_page, sort_order)
-               VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
-            (topic_id, title, context, instructions, source_page, sort_order),
+def insert_exercise(cur, topic_id: int, title: str, context: str | None, instructions: str, source_page: str, sort_order: int) -> int:
+    """Insert an exercise and return its id. Caller is responsible for commit/rollback."""
+    cur.execute(
+        """INSERT INTO exercises (topic_id, title, context, instructions, source_page, sort_order)
+           VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
+        (topic_id, title, context, instructions, source_page, sort_order),
+    )
+    return cur.fetchone()[0]
+
+
+_INSERT_QUESTION_SQL = """
+    INSERT INTO questions (exercise_id, difficulty, question, answer, explanation, choices, sort_order)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT DO NOTHING
+"""
+_BATCH_CHUNK_SIZE = 3
+
+
+def insert_questions(cur, exercise_id: int, questions: list[dict], source_page: str) -> int:
+    """Insert questions in chunks of _BATCH_CHUNK_SIZE using savepoints.
+
+    Runs inside the caller's transaction (no commit/rollback here).
+    Each chunk is wrapped in a savepoint so a bad chunk is rolled back
+    to the savepoint and retried row-by-row without aborting the outer
+    transaction or losing already-inserted rows from earlier chunks.
+    """
+    rows = [
+        (
+            exercise_id,
+            q.get("difficulty", 3),
+            q.get("question", ""),
+            q.get("answer", ""),
+            q.get("explanation", ""),
+            json.dumps(q["choices"]) if q.get("choices") else None,
+            i + 1,
         )
-        conn.commit()
-        return cur.fetchone()[0]
+        for i, q in enumerate(questions)
+    ]
 
-
-def insert_questions(conn, exercise_id: int, questions: list[dict], source_page: str) -> int:
-    """Insert questions, return count inserted."""
     inserted = 0
-    with conn.cursor() as cur:
-        for i, q in enumerate(questions):
-            difficulty = q.get("difficulty", 3)
-            question_text = q.get("question", "")
-            answer = q.get("answer", "")
-            explanation = q.get("explanation", "")
-            choices = json.dumps(q.get("choices", [])) if q.get("choices") else None
-
-            try:
-                cur.execute(
-                    """INSERT INTO questions (exercise_id, difficulty, question, answer, explanation, choices, sort_order)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-                    (exercise_id, difficulty, question_text, answer, explanation, choices, i + 1),
-                )
-                if cur.rowcount > 0:
-                    inserted += 1
-            except psycopg2.Error as e:
-                print(f"  WARN: Skipping question: {e}")
-                conn.rollback()
-                continue
-    conn.commit()
+    for start in range(0, len(rows), _BATCH_CHUNK_SIZE):
+        chunk = rows[start: start + _BATCH_CHUNK_SIZE]
+        sp = f"sp_{start}"
+        cur.execute(f"SAVEPOINT {sp}")
+        try:
+            psycopg2.extras.execute_batch(cur, _INSERT_QUESTION_SQL, chunk)
+            inserted += cur.rowcount
+            cur.execute(f"RELEASE SAVEPOINT {sp}")
+        except psycopg2.Error as batch_err:
+            cur.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+            print(f"  WARN: batch insert failed ({batch_err}); retrying row-by-row")
+            for row in chunk:
+                sp_row = f"sp_row_{row[-1]}"
+                cur.execute(f"SAVEPOINT {sp_row}")
+                try:
+                    cur.execute(_INSERT_QUESTION_SQL, row)
+                    inserted += cur.rowcount
+                    cur.execute(f"RELEASE SAVEPOINT {sp_row}")
+                except psycopg2.Error as row_err:
+                    cur.execute(f"ROLLBACK TO SAVEPOINT {sp_row}")
+                    print(f"  WARN: skipping question sort_order={row[-1]}: {row_err}")
     return inserted
 
 
@@ -546,6 +596,13 @@ def _process_all_results(
 
     total_inserted = 0
     total_errors = 0
+    topic_cache: dict[tuple, int] = {}
+
+    def _get_topic_id(topic_name: str) -> int:
+        key = (subject_id, topic_name)
+        if key not in topic_cache:
+            topic_cache[key] = upsert_topic(conn, subject_id, topic_name)
+        return topic_cache[key]
 
     for group_key, group in groups.items():
         should_merge = group["should_merge"]
@@ -572,15 +629,17 @@ def _process_all_results(
                     print(f"    A{j}: {q.get('answer', '')[:80]}")
                 continue
 
-            topic_id = upsert_topic(conn, subject_id, merged["topic"])
+            topic_id = _get_topic_id(merged["topic"])
             source_pages = "+".join(meta["image_path"].stem for _, meta in pages)
             try:
-                exercise_id = insert_exercise(
-                    conn, topic_id, merged["title"],
-                    merged.get("context"), merged.get("instructions", ""),
-                    source_pages, 1,
-                )
-                inserted = insert_questions(conn, exercise_id, merged["questions"], source_pages)
+                with conn.cursor() as cur:
+                    exercise_id = insert_exercise(
+                        cur, topic_id, merged["title"],
+                        merged.get("context"), merged.get("instructions", ""),
+                        source_pages, 1,
+                    )
+                    inserted = insert_questions(cur, exercise_id, merged["questions"], source_pages)
+                conn.commit()
                 total_inserted += inserted
                 print(f"  [{merged['title']}] Inserted: {inserted}/{len(merged['questions'])} questions")
             except Exception as e:
@@ -628,21 +687,23 @@ def _process_all_results(
                             print(f"    A{j}: {q.get('answer', '')[:80]}")
                     continue
 
-                page_topic_id = upsert_topic(conn, subject_id, page_topic)
+                page_topic_id = _get_topic_id(page_topic)
                 source_page = img_path.stem
                 try:
                     for ei, ex in enumerate(exercises):
                         ex_questions = ex.get("questions", [])
                         if not ex_questions:
                             continue
-                        exercise_id = insert_exercise(
-                            conn, page_topic_id,
-                            ex.get("title", page_topic),
-                            ex.get("context") or None,
-                            ex.get("instructions", ""),
-                            source_page, ei + 1,
-                        )
-                        inserted = insert_questions(conn, exercise_id, ex_questions, source_page)
+                        with conn.cursor() as cur:
+                            exercise_id = insert_exercise(
+                                cur, page_topic_id,
+                                ex.get("title", page_topic),
+                                ex.get("context") or None,
+                                ex.get("instructions", ""),
+                                source_page, ei + 1,
+                            )
+                            inserted = insert_questions(cur, exercise_id, ex_questions, source_page)
+                        conn.commit()
                         total_inserted += inserted
                         print(f"  [{ex.get('title', page_topic)}] Inserted: {inserted}/{len(ex_questions)} questions")
                 except Exception as e:
@@ -703,8 +764,11 @@ def ingest_folder(config: dict, folder: Path, subject: str, dry_run: bool, immed
             batch_id = resume_batch_id
         else:
             print("Building batch JSONL …")
-            jsonl = build_batch_jsonl(config, registry, subject)
-            file_id = upload_batch_file(batch_base_url, api_key, jsonl)
+            jsonl_file = build_batch_jsonl(config, registry, subject)
+            try:
+                file_id = upload_batch_file(batch_base_url, api_key, jsonl_file)
+            finally:
+                jsonl_file.close()
             batch_id = create_batch(batch_base_url, api_key, file_id)
 
         poll_interval = llm_cfg.get("batch_poll_interval", 30)
